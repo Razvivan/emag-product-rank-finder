@@ -14,6 +14,7 @@ import csv
 import random
 import re
 import time
+import re
 import unicodedata
 import urllib.parse
 from typing import List, Dict, Optional, Tuple
@@ -79,11 +80,45 @@ def get_chrome_driver(headless=True):
         driver = webdriver.Chrome(options=chrome_options)
     return driver
 
-def fetch_html_selenium(url: str, delay_sec: float = 2.0) -> str:
-    driver = get_chrome_driver(headless=True)
+def fetch_html_selenium(url: str, delay_sec: float = 2.0, force_grid: bool = False) -> str:
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.common.by import By
+    driver = get_chrome_driver(headless=False)
     try:
         driver.get(url)
-        time.sleep(delay_sec)  # Wait for page to load
+        time.sleep(delay_sec)  # Initial wait for page to load
+        # Optionally force grid view
+        if force_grid:
+            try:
+                grid_btn = driver.find_element(By.CSS_SELECTOR, "button[aria-label='Grid view'], .card-view-toggle .icon-grid")
+                if grid_btn:
+                    grid_btn.click()
+                    time.sleep(1)
+            except Exception:
+                pass
+        # Wait for at least one badge element to appear
+        try:
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, ".card-v2-badge-cmp, .badge, .card-v2-badge"))
+            )
+        except Exception:
+            pass
+        # Scroll through all product cards and hover over each to trigger badge loading
+        from selenium.common.exceptions import StaleElementReferenceException
+        card_selector = ".card-item, .card-v2, .product-card, .product-container"
+        for _ in range(2):  # Try twice to catch late-loaded cards
+            cards = driver.find_elements(By.CSS_SELECTOR, card_selector)
+            for card in cards:
+                try:
+                    driver.execute_script("arguments[0].scrollIntoView();", card)
+                    webdriver.ActionChains(driver).move_to_element(card).perform()
+                    time.sleep(0.2)
+                except Exception:
+                    continue
+        # Scroll to bottom to trigger lazy loading if needed
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(2)
         input("[yellow]If you see a CAPTCHA in the browser, please solve it now, then press Enter here to continue scraping...")
         html = driver.page_source
     finally:
@@ -113,19 +148,19 @@ def fetch_html(url: str, headers: dict, proxy: Optional[str] = None, delay_sec: 
 def parse_cards(html: str) -> List[Dict]:
     soup = BeautifulSoup(html, "lxml")
     cards = []
-    # Broaden to match all product card variants
-    product_grid = soup.find("section", id=re.compile(r"card_grid|main-container|search-results"))
-    if not product_grid:
-        product_grid = soup.find("main")
-    # Match all possible product card classes
-    card_classes = ["card-item", "card-v2", "product-card", "product-container"]
+    # Match all possible product card containers for grid and list view
+    card_selectors = [
+        "div.card-item", # grid and list
+        "div.card-v2",   # grid and list
+        "div.product-card",
+        "div.product-container",
+        "div.card-standard", # list view
+        "div.card-list",     # list view
+        "div.card-list-updated" # list view
+    ]
     product_containers = []
-    if product_grid:
-        for cls in card_classes:
-            product_containers.extend(product_grid.find_all("div", class_=re.compile(cls)))
-    else:
-        for cls in card_classes:
-            product_containers.extend(soup.find_all("div", class_=re.compile(cls)))
+    for selector in card_selectors:
+        product_containers.extend(soup.select(selector))
 
     # Remove duplicates
     seen = set()
@@ -137,6 +172,7 @@ def parse_cards(html: str) -> List[Dict]:
     product_containers = unique_containers
 
     for idx, container in enumerate(product_containers, start=1):
+        # Find product link (grid and list)
         link = container.find("a", href=re.compile(r"/pd/[A-Za-z0-9]+/"))
         if not link:
             continue
@@ -144,15 +180,41 @@ def parse_cards(html: str) -> List[Dict]:
         if not pd_code_match:
             continue
         pd_code = pd_code_match.group(1)
-        # Try to get the product title from the card or link
+        # Title extraction (grid and list view)
         title = ""
+        # Try h2/h3 first
         title_tag = container.find("h2") or container.find("h3")
         if title_tag:
             title = title_tag.get_text(strip=True)
+        # Try anchor with .card-v2-title inside .card-v2-title-wrapper (list view)
+        if not title:
+            title_wrapper = container.find("h2", class_=re.compile("card-v2-title-wrapper"))
+            if title_wrapper:
+                anchor = title_wrapper.find("a", class_=re.compile("card-v2-title"))
+                if anchor:
+                    title = anchor.get_text(strip=True)
+        # Fallback to anchor title or text
         if not title:
             title = link.get("title", link.get_text("").strip())
+        # Filter out review/rating widgets
+        if re.match(r"^\d+(\.\d+)? de review-uri", title) or "review-uri" in title:
+            continue
         url_abs = urllib.parse.urljoin("https://www.emag.ro/", link["href"])
-        is_promoted = bool(container.find(string=re.compile(r"promovat|badge|cmp|sponsor", re.I)))
+        # Robust promoted badge detection (grid and list)
+        is_promoted = False
+        badge_elems = container.find_all(["span", "div"], class_=re.compile(r"badge|commercial-badge|card-v2-badge-cmp"))
+        for badge in badge_elems:
+            # Extract visible text, ignoring .hidden spans
+            visible_text = ""
+            for elem in badge.descendants:
+                if getattr(elem, 'name', None) is None and elem.strip():
+                    parent_classes = elem.parent.get('class', []) if getattr(elem, 'parent', None) else []
+                    if 'hidden' not in parent_classes:
+                        visible_text += elem.strip()
+            if re.search(r"promovat|promovat", visible_text, re.I):
+                is_promoted = True
+                break
+        # Sponsored detection unchanged
         is_sponsored = bool(container.find(string=re.compile(r"sponsored|sponsorizat|reclama", re.I)))
         console.print(f"[debug] Card idx={idx}, pd_code={pd_code}, title={title}, promoted={is_promoted}, sponsored={is_sponsored}")
         cards.append({
