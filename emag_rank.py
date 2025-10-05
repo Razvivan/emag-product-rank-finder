@@ -60,10 +60,9 @@ HEADERS = {
 # Selenium helper
 def get_chrome_driver(headless=True):
     chrome_options = Options()
-    # Run in visible mode for manual CAPTCHA solving
-    # if headless:
-    #     chrome_options.add_argument('--headless')
-    #     chrome_options.add_argument('--disable-gpu')
+    if headless:
+        chrome_options.add_argument('--headless')
+        chrome_options.add_argument('--disable-gpu')
     chrome_options.add_argument('--no-sandbox')
     chrome_options.add_argument('--disable-dev-shm-usage')
     chrome_options.add_argument('--window-size=1920,1080')
@@ -80,19 +79,25 @@ def get_chrome_driver(headless=True):
         driver = webdriver.Chrome(options=chrome_options)
     return driver
 
-def fetch_html_selenium(url: str, delay_sec: float = 2.0, force_grid: bool = False) -> str:
+def fetch_html_selenium(url: str, delay_sec: float = 2.0, force_grid: bool = False, headless: bool = True) -> str:
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
     from selenium.webdriver.common.by import By
-    driver = get_chrome_driver(headless=False)
+    driver = get_chrome_driver(headless=headless)
+    console.print(f"[debug] Selenium headless mode: {headless}")
     try:
         driver.get(url)
         time.sleep(delay_sec)  # Initial wait for page to load
-        # Optionally force grid view
+        # Always force grid view if requested
         if force_grid:
             try:
-                grid_btn = driver.find_element(By.CSS_SELECTOR, "button[aria-label='Grid view'], .card-view-toggle .icon-grid")
-                if grid_btn:
+                # Wait for the grid/list toggle buttons to be present
+                WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "button.listing-view-type-change[data-type='2'][data-target='card_grid']"))
+                )
+                grid_btn = driver.find_element(By.CSS_SELECTOR, "button.listing-view-type-change[data-type='2'][data-target='card_grid']")
+                # Only click if not already active
+                if "active" not in grid_btn.get_attribute("class"):
                     grid_btn.click()
                     time.sleep(1)
             except Exception:
@@ -104,18 +109,17 @@ def fetch_html_selenium(url: str, delay_sec: float = 2.0, force_grid: bool = Fal
             )
         except Exception:
             pass
-        # Scroll through all product cards and hover over each to trigger badge loading
+        # Scroll through all product cards and hover over each to trigger badge loading (only once)
         from selenium.common.exceptions import StaleElementReferenceException
         card_selector = ".card-item, .card-v2, .product-card, .product-container"
-        for _ in range(2):  # Try twice to catch late-loaded cards
-            cards = driver.find_elements(By.CSS_SELECTOR, card_selector)
-            for card in cards:
-                try:
-                    driver.execute_script("arguments[0].scrollIntoView();", card)
-                    webdriver.ActionChains(driver).move_to_element(card).perform()
-                    time.sleep(0.2)
-                except Exception:
-                    continue
+        cards = driver.find_elements(By.CSS_SELECTOR, card_selector)
+        for card in cards:
+            try:
+                driver.execute_script("arguments[0].scrollIntoView();", card)
+                webdriver.ActionChains(driver).move_to_element(card).perform()
+                time.sleep(0.2)
+            except Exception:
+                continue
         # Scroll to bottom to trigger lazy loading if needed
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(2)
@@ -148,7 +152,46 @@ def fetch_html(url: str, headers: dict, proxy: Optional[str] = None, delay_sec: 
 def parse_cards(html: str) -> List[Dict]:
     soup = BeautifulSoup(html, "lxml")
     cards = []
-    # Match all possible product card containers for grid and list view
+    card_grid = soup.find("div", id="card_grid")
+    console.print(f"[debug] Grid parsing: found card_grid={bool(card_grid)}")
+    if card_grid:
+        product_containers = card_grid.find_all("div", class_="card-item")
+        # Enumerate all cards in DOM order for true position
+        for i, card in enumerate(product_containers):
+            url_abs = card.get("data-url")
+            title = card.get("data-name")
+            pd_code = extract_pd_code(url_abs) if url_abs else None
+            # Record data-position for reference, but use DOM index for ranking
+            try:
+                data_position = int(card.get("data-position", "0"))
+            except Exception:
+                data_position = None
+            # Robust promoted badge detection (grid view)
+            is_promoted = False
+            badge_elems = card.find_all(["span", "div"], class_=re.compile(r"badge|commercial-badge|card-v2-badge-cmp"))
+            for badge in badge_elems:
+                visible_text = ""
+                for elem in badge.descendants:
+                    if getattr(elem, 'name', None) is None and elem.strip():
+                        parent_classes = elem.parent.get('class', []) if getattr(elem, 'parent', None) else []
+                        if 'hidden' not in parent_classes:
+                            visible_text += elem.strip()
+                if re.search(r"promovat|promoted", visible_text, re.I):
+                    is_promoted = True
+                    break
+            # Sponsored detection
+            is_sponsored = bool(card.find(string=re.compile(r"sponsored|sponsorizat|reclama", re.I)))
+            cards.append({
+                "pd_code": pd_code,
+                "url_abs": url_abs,
+                "title": title,
+                "is_promoted": is_promoted,
+                "is_sponsored": is_sponsored,
+                "idx_on_page": i + 1,
+                "data_position": data_position,
+            })
+        return cards
+    # Fallback for list view and other layouts
     card_selectors = [
         "div.card-item", # grid and list
         "div.card-v2",   # grid and list

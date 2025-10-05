@@ -1,14 +1,20 @@
-
 import streamlit as st
 import pandas as pd
 import time
 import urllib.parse
 from emag_rank import extract_pd_code, build_search_url, fetch_html, fetch_html_selenium, parse_cards, filter_cards, find_target
 
+
 st.set_page_config(page_title="eMAG Product Rank Finder", layout="wide")
 
 # Sidebar for input
 with st.sidebar:
+    headless_mode = st.checkbox("Use Headless Mode (Faster)", value=True)
+    st.markdown("---")
+    st.markdown("### Bulk Analysis")
+    st.markdown("Upload a CSV file with product URLs and keywords for batch analysis.")
+    csv_file = st.file_uploader("Import CSV for Bulk Analysis", type=["csv"])
+    run_bulk = st.button("Run Bulk Analysis", use_container_width=True)
     st.title("🔍 eMAG Rank Finder")
     st.markdown("""
     <style>
@@ -17,17 +23,25 @@ with st.sidebar:
     """, unsafe_allow_html=True)
     with st.expander("Input Parameters", expanded=True):
         product_url = st.text_input("Product URL", "https://www.emag.ro/purificator-de-aer-smart-levoit-core-300s-wi-fi-filtru-3-in-1-true-hepa-carbon-activ-senzor-calitate-aer-mod-auto-alexa-google-home-panou-comanda-touch-screen-control-remote-alb-core300s/pd/DPN7K9MBM/")
-        keywords = st.text_area("Keywords (comma or newline separated)", "levoit core 300s, purificator aer levoit, core300s")
-        pages = st.number_input("Pages to search per keyword (0=auto)", min_value=0, max_value=20, value=1)
-        unbounded_cap = st.number_input("Max pages if auto", min_value=1, max_value=80, value=10)
-        delay_sec = st.number_input("Delay between requests (seconds)", min_value=1.0, max_value=20.0, value=8.0)
-        strict_grid = st.checkbox("Strict grid filtering", value=True)
-        ignore_sponsored = st.checkbox("Ignore sponsored/promoted", value=True)
-        debug = st.checkbox("Show debug info", value=False)
-        st.markdown("**View Type:**")
-        use_grid = st.checkbox("Analyze Grid View", value=True)
-        use_list = st.checkbox("Analyze List View", value=False)
-        submit = st.button("Run Analysis", use_container_width=True)
+    from streamlit_tags import st_tags
+    keywords = st_tags(
+        label="Keywords (press Enter after each)",
+        text="Type and press Enter...",
+        value=["levoit core 300s", "purificator aer levoit", "core300s"],
+        suggestions=[],
+        maxtags=20,
+        key="1"
+    )
+    pages = st.number_input("Pages to search per keyword (0=auto)", min_value=0, max_value=20, value=1)
+    unbounded_cap = st.number_input("Max pages if auto", min_value=1, max_value=80, value=10)
+    delay_sec = st.number_input("Delay between requests (seconds)", min_value=1.0, max_value=20.0, value=8.0)
+    strict_grid = st.checkbox("Strict grid filtering", value=True)
+    ignore_sponsored = st.checkbox("Ignore sponsored/promoted", value=True)
+    debug = st.checkbox("Show debug info", value=False)
+    st.markdown("**View Type:**")
+    use_grid = st.checkbox("Analyze Grid View", value=True)
+    use_list = st.checkbox("Analyze List View", value=False)
+    submit = st.button("Run Analysis", use_container_width=True)
 
 st.markdown("""
 <style>
@@ -38,6 +52,104 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.header("eMAG Product Rank Finder", divider="rainbow")
+# Bulk analysis logic (preview and run)
+if 'csv_file' in locals() and csv_file is not None:
+    st.success(f"CSV uploaded: {csv_file.name}")
+    batch_df = pd.read_csv(csv_file)
+    st.write("Preview of uploaded CSV:")
+    st.dataframe(batch_df.head())
+    if 'run_bulk' in locals() and run_bulk:
+        st.info("Running bulk analysis. Please solve any CAPTCHAs in the browser window if prompted.")
+        bulk_results = []
+        for idx, row in batch_df.iterrows():
+            product_url = row.get('Product URL', '') or row.get('ProductURL', '')
+            keywords = row.get('Keyword', '') or row.get('Keywords', '')
+            if not product_url or not keywords:
+                continue
+            target_pd_code = extract_pd_code(product_url)
+            kw_list = [kw.strip() for kw in str(keywords).replace("\n", ",").split(",") if kw.strip()]
+            for keyword in kw_list:
+                # Only run enabled views
+                if use_grid:
+                    view_type = "Grid"
+                    ref = "grid"
+                    for page in range(1, pages + 1 if pages > 0 else unbounded_cap + 1):
+                        search_url = f"https://www.emag.ro/search/{urllib.parse.quote(keyword)}?ref={ref}&page={page}"
+                        st.write(f"[DEBUG] Bulk: View={view_type}, URL={search_url}")
+                        html = fetch_html_selenium(search_url, delay_sec=delay_sec, force_grid=True, headless=headless_mode)
+                        cards = parse_cards(html)
+                        filtered_cards = filter_cards(cards, strict_grid, ignore_sponsored)
+                        matches = [card for card in filtered_cards if card["pd_code"] == target_pd_code]
+                        for card in matches:
+                            if debug:
+                                st.write(f"[DEBUG] Match: idx_on_page={card['idx_on_page']}, promoted={card['is_promoted']}, sponsored={card['is_sponsored']}, title={card['title']}")
+                            result = {
+                                "Batch Row": idx + 1,
+                                "Product URL": product_url,
+                                "Keyword": keyword,
+                                "View": view_type,
+                                "Page": page,
+                                "Occurrence": card['idx_on_page'],
+                                "Position on Page": str(card['idx_on_page']),
+                                "Global Rank": str(card['idx_on_page']),
+                                "Title": card["title"],
+                                "Result URL": card["url_abs"],
+                                "Page URL": search_url,
+                                "Promoted": card["is_promoted"],
+                                "Sponsored": card["is_sponsored"],
+                                "Product Code": target_pd_code,
+                            }
+                            bulk_results.append(result)
+                        if not cards:
+                            break
+                        time.sleep(delay_sec)
+                if use_list:
+                    view_type = "List"
+                    ref = "list"
+                    for page in range(1, pages + 1 if pages > 0 else unbounded_cap + 1):
+                        search_url = f"https://www.emag.ro/search/{urllib.parse.quote(keyword)}?ref={ref}&page={page}"
+                        st.write(f"[DEBUG] Bulk: View={view_type}, URL={search_url}")
+                        html = fetch_html(search_url, {}, delay_sec=delay_sec)
+                        cards = parse_cards(html)
+                        filtered_cards = filter_cards(cards, strict_grid, ignore_sponsored)
+                        matches = [card for card in filtered_cards if card["pd_code"] == target_pd_code]
+                        seen = set()
+                        unique_matches = []
+                        for card in matches:
+                            key = (card["pd_code"], card["title"], card["is_promoted"], card["is_sponsored"])
+                            if key not in seen:
+                                seen.add(key)
+                                unique_matches.append(card)
+                        for match_idx, card in enumerate(unique_matches, start=1):
+                            margin_error = max(2, int(0.05 * len(filtered_cards)))
+                            result = {
+                                "Batch Row": idx + 1,
+                                "Product URL": product_url,
+                                "Keyword": keyword,
+                                "View": view_type,
+                                "Page": page,
+                                "Occurrence": match_idx,
+                                "Position on Page": f"{card['idx_on_page']} ±{margin_error}",
+                                "Global Rank": f"{card['idx_on_page']} ±{margin_error}",
+                                "Title": card["title"],
+                                "Result URL": card["url_abs"],
+                                "Page URL": search_url,
+                                "Promoted": card["is_promoted"],
+                                "Sponsored": card["is_sponsored"],
+                                "Product Code": target_pd_code,
+                            }
+                            bulk_results.append(result)
+                        if not cards:
+                            break
+                        time.sleep(delay_sec)
+        if bulk_results:
+            bulk_df = pd.DataFrame(bulk_results)
+            st.success("Bulk Results:")
+            st.dataframe(bulk_df, use_container_width=True)
+            csv_bulk = bulk_df.to_csv(index=False).encode('utf-8')
+            st.download_button("Download Bulk Results CSV", csv_bulk, "emag_bulk_results.csv", "text/csv", use_container_width=True)
+        else:
+            st.warning("No results found in bulk analysis.")
 st.markdown("""
 Easily check where your product appears for multiple keywords on eMAG. 
 **Instructions:** Enter the product URL and keywords in the sidebar, adjust options, and click **Run Analysis**. Results will appear below and can be downloaded as CSV.
@@ -46,7 +158,7 @@ Easily check where your product appears for multiple keywords on eMAG.
 if 'submit' in locals() and submit:
     st.info("Running analysis. Please solve any CAPTCHAs in the browser window if prompted.")
     target_pd_code = extract_pd_code(product_url)
-    kw_list = [kw.strip() for kw in keywords.replace("\n", ",").split(",") if kw.strip()]
+    kw_list = [kw.strip() for kw in keywords if kw.strip()]
     results = []
     progress_bar = st.progress(0)
     total_tasks = len(kw_list) * ((1 if use_grid else 0) + (1 if use_list else 0))
@@ -58,32 +170,24 @@ if 'submit' in locals() and submit:
             for page in range(1, pages + 1 if pages > 0 else unbounded_cap + 1):
                 search_url = f"https://www.emag.ro/search/{urllib.parse.quote(keyword)}?ref={ref}&page={page}"
                 if view_type == "Grid":
-                    html = fetch_html_selenium(search_url, delay_sec=delay_sec, force_grid=True)
+                    html = fetch_html_selenium(search_url, delay_sec=delay_sec, force_grid=True, headless=headless_mode)
                 else:
                     html = fetch_html(search_url, {}, delay_sec=delay_sec)
                 cards = parse_cards(html)
                 filtered_cards = filter_cards(cards, strict_grid, ignore_sponsored)
                 if debug:
                     st.write(f"[{view_type}] Keyword: {keyword}, Page: {page}, Filtered cards: {len(filtered_cards)}")
-                # Find all occurrences of the target product
                 matches = [card for card in filtered_cards if card["pd_code"] == target_pd_code]
-                # Deduplicate only exact matches (same pd_code, title, promoted, sponsored)
-                seen = set()
-                unique_matches = []
                 for card in matches:
-                    key = (card["pd_code"], card["title"], card["is_promoted"], card["is_sponsored"])
-                    if key not in seen:
-                        seen.add(key)
-                        unique_matches.append(card)
-                for match_idx, card in enumerate(unique_matches, start=1):
-                    margin_error = max(2, int(0.05 * len(filtered_cards)))
+                    if debug:
+                        st.write(f"[DEBUG] Match: idx_on_page={card['idx_on_page']}, promoted={card['is_promoted']}, sponsored={card['is_sponsored']}, title={card['title']}")
                     result = {
                         "Keyword": keyword,
                         "View": view_type,
                         "Page": page,
-                        "Occurrence": match_idx,
-                        "Position on Page": f"{card['idx_on_page']} ±{margin_error}",
-                        "Global Rank": f"{card['idx_on_page']} ±{margin_error}",
+                        "Occurrence": card['idx_on_page'],
+                        "Position on Page": str(card['idx_on_page']),
+                        "Global Rank": str(card['idx_on_page']),
                         "Title": card["title"],
                         "Result URL": card["url_abs"],
                         "Page URL": search_url,
